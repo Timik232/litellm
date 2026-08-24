@@ -47,6 +47,7 @@ from litellm.proxy.auth.auth_checks import (
     _virtual_key_soft_budget_check,
     get_key_object,
     get_user_object,
+    invalidate_team_member_spend_state,
     vector_store_access_check,
 )
 from litellm.caching.in_memory_cache import InMemoryCache
@@ -6939,3 +6940,35 @@ def test_model_has_no_cost_mapping_alias_to_a_group_priced_through_model_info_is
     router = _router_with_a_group_priced_through_model_info()
 
     assert model_has_no_cost_mapping(model="model-info-priced-alias", llm_router=router) is False
+
+
+@pytest.mark.asyncio
+async def test_invalidate_team_member_spend_state_clears_the_spend_counter_and_both_membership_cache_keys():
+    """A team-member budget reset must invalidate the spend counter AND both
+    independently-keyed membership caches (user_api_key_auth.py's admission
+    check writes one key format, budget_reservation.py and auth_checks.py's
+    own get_team_membership() write the other) or a stale read keeps 429ing
+    after the reset. Asserted against real cache reads, not mock call args,
+    so a change that keeps the call but drops its effect still fails."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    real_cache = UserApiKeyCache()
+    await real_cache.async_set_cache(key="team-1_user-1", value="stale-membership")
+    await real_cache.async_set_cache(key="team_membership:user-1:team-1", value="stale-membership")
+
+    real_spend_counter_cache = DualCache()
+    real_spend_counter_cache.in_memory_cache.set_cache(key="spend:team_member:user-1:team-1", value=999.0)
+
+    with patch(  # test-quality-ok: injects a real DualCache for the module global, not a behavior mock
+        "litellm.proxy.proxy_server.spend_counter_cache", real_spend_counter_cache
+    ):
+        await invalidate_team_member_spend_state(
+            user_id="user-1",
+            team_id="team-1",
+            user_api_key_cache=real_cache,
+        )
+
+    assert await real_cache.async_get_cache(key="team-1_user-1") is None
+    assert await real_cache.async_get_cache(key="team_membership:user-1:team-1") is None
+    assert real_spend_counter_cache.in_memory_cache.get_cache(key="spend:team_member:user-1:team-1") is None
